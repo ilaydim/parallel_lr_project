@@ -196,4 +196,61 @@ fig.suptitle("Execution Time vs Processes  —  MPI Linear Regression",
 fig.tight_layout()
 save(fig, "plot_scalability.png")
 
+# ── TABLO: Speedup ve Efficiency (compute only) ───────────────────
+large_fig, ax = plt.subplots(figsize=(10, 4))
+ax.axis("off")
+
+# Tablo verisi
+col_labels = ["N"] + [f"P={p}" for p in P_values]
+row_labels_S = []
+row_labels_E = []
+table_data = []
+
+for n in N_values:
+    sub = df[df["N"] == n]
+    S_row = [N_labels[n]] + [
+        f"{sub[sub['P']==p]['speedup_compute'].values[0]:.2f}"
+        if not sub[sub['P']==p].empty else "—"
+        for p in P_values
+    ]
+    E_row = [""] + [
+        f"{sub[sub['P']==p]['efficiency_compute'].values[0]:.2f}"
+        if not sub[sub['P']==p].empty else "—"
+        for p in P_values
+    ]
+    table_data.append(S_row)
+    table_data.append(E_row)
+
+# Satır etiketleri
+row_labels = []
+for n in N_values:
+    row_labels.append("S")
+    row_labels.append("E")
+
+tbl = ax.table(
+    cellText=table_data,
+    colLabels=col_labels,
+    rowLabels=row_labels,
+    loc="center",
+    cellLoc="center"
+)
+tbl.auto_set_font_size(False)
+tbl.set_fontsize(10)
+tbl.scale(1.2, 1.8)
+
+# Header rengi
+for j in range(len(col_labels)):
+    tbl[(0, j)].set_facecolor("#1F4E79")
+    tbl[(0, j)].set_text_props(color="white", fontweight="bold")
+
+# S satırları açık mavi, E satırları beyaz
+for i, n in enumerate(N_values):
+    for j in range(-1, len(col_labels)):
+        tbl[(i*2+1, j)].set_facecolor("#D6E4F0")  # S satırı
+        tbl[(i*2+2, j)].set_facecolor("#FFFFFF")   # E satırı
+
+large_fig.suptitle("Speedup (S) and Efficiency (E) — Compute Only",
+                   fontsize=13, fontweight="bold")
+save(large_fig, "plot_table.png")
+
 print("\nAll done.")
