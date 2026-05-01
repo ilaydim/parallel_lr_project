@@ -1,0 +1,6 @@
+parallel_lr
+venv/
+__pycache__/
+*.pyc
+*.o
+.DS_Store
