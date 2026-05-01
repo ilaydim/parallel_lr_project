@@ -5,22 +5,31 @@
  * Model:  y = beta0 + beta1 * x   (Ordinary Least Squares)
  *
  * Three collective MPI functions used:
- *   1. MPI_Scatter  — distribute chunk-size info to each process
- *   2. MPI_Scatterv — distribute data chunks (only chunk per process allocated)
+ *   1. MPI_Bcast    — broadcast dataset size N to all processes
+ *   2. MPI_Scatterv — distribute data chunks; each process receives
+ *                     only its N/P elements (not the full dataset)
  *   3. MPI_Reduce   — accumulate partial sums (Sx, Sy, Sxx, Sxy) on root
  *
  * Memory design:
- *   - Root allocates the full x[] and y[] arrays (for generation, seq baseline, MSE).
- *   - Worker processes allocate ONLY their local chunk → O(N/P) RAM per worker.
- *   - This replaces the original MPI_Bcast approach which required O(N) RAM on EVERY
- *     process, making large N (250M+) impractical on memory-constrained machines.
+ *   - Root allocates full N elements (needed for data generation +
+ *     sequential baseline), then scatters chunks and frees the full arrays.
+ *   - Non-root processes allocate only N/P elements.
+ *   - Communication volume per process: O(N/P) instead of O(N).
+ *
+ * Timing design:
+ *   - serial_time : measured on rank 0 only, before any MPI communication.
+ *   - par_time    : wall time from MPI_Barrier (before MPI_Bcast) to
+ *                   MPI_Barrier (after MPI_Reduce); covers the full
+ *                   parallel pipeline including communication.
+ *   - speedup     : serial_time / par_time
+ *   - efficiency  : speedup / P
  *
  * Compile:
  *   mpicc -O2 -o parallel_lr parallel_lr.c -lm
  *
  * Run:
  *   mpirun -np <P> ./parallel_lr <N>
- *   e.g.  mpirun -np 4 ./parallel_lr 1000000
+ *   e.g.  mpirun -np 8 ./parallel_lr 250000000
  *
  * Output:
  *   Prints sequential and parallel coefficients, MSE, timings,
@@ -31,7 +40,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-#include <time.h>
 #include <mpi.h>
 
 /* ------------------------------------------------------------------ */
@@ -100,129 +108,167 @@ int main(int argc, char **argv)
     }
 
     /* ================================================================
-       STEP 1 — COMPUTE CHUNK SIZES FOR EACH PROCESS
+       STEP 1 — ROOT GENERATES FULL DATASET FOR SEQUENTIAL BASELINE
+       Non-root processes do not allocate anything yet.
        ================================================================ */
-    int base_chunk = n / size;
-    int remainder  = n % size;
-
-    /* Build send_counts and displs on ALL processes (cheap, O(P)) */
-    int *send_counts = (int *)malloc(size * sizeof(int));
-    int *displs      = (int *)malloc(size * sizeof(int));
-    if (!send_counts || !displs) {
-        fprintf(stderr, "Process %d: malloc for bookkeeping arrays failed\n", rank);
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-    for (int i = 0; i < size; i++) {
-        send_counts[i] = base_chunk + (i < remainder ? 1 : 0);
-        displs[i]      = (i == 0) ? 0 : displs[i-1] + send_counts[i-1];
-    }
-
-    int my_count = send_counts[rank];
-
-    /* ================================================================
-       COLLECTIVE FUNCTION 1: MPI_Scatter
-       Root scatters the per-process chunk size so every process knows
-       how much data it will receive (used as a bookkeeping broadcast).
-       ================================================================ */
-    int confirmed_count;
-    MPI_Scatter(send_counts, 1, MPI_INT,
-                &confirmed_count, 1, MPI_INT,
-                0, MPI_COMM_WORLD);
-    /* confirmed_count == my_count; kept for symmetry with original design */
-
-    /* ================================================================
-       MEMORY ALLOCATION
-       Root: full arrays (needed for data generation, seq LR, MSE)
-       Workers: only their local chunk → O(N/P) RAM per worker
-       ================================================================ */
-    double *x_full = NULL, *y_full = NULL;   /* root only */
-    double *x_local = NULL, *y_local = NULL; /* all processes */
+    double *x_full = NULL, *y_full = NULL;
+    double  beta0_seq = 0.0, beta1_seq = 0.0;
+    double  serial_time = 0.0;
 
     if (rank == 0) {
         x_full = (double *)malloc((size_t)n * sizeof(double));
         y_full = (double *)malloc((size_t)n * sizeof(double));
         if (!x_full || !y_full) {
-            fprintf(stderr, "Root: malloc for full arrays failed (N=%d, ~%.1f GB needed)\n",
-                    n, (double)n * 2 * sizeof(double) / 1e9);
+            fprintf(stderr, "Root: malloc failed for full dataset\n");
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
         generate_data(x_full, y_full, n, 42);
     }
 
-    x_local = (double *)malloc(my_count * sizeof(double));
-    y_local = (double *)malloc(my_count * sizeof(double));
+    /* ================================================================
+       SERIAL BASELINE
+       Measured on rank 0 only, before any MPI communication.
+       All other ranks wait at the barrier so conditions are fair.
+       ================================================================ */
+    if (rank == 0) {
+        double seq_start = MPI_Wtime();
+        sequential_lr(x_full, y_full, n, &beta0_seq, &beta1_seq);
+        serial_time = MPI_Wtime() - seq_start;
+    }
+
+    /* All workers wait here while root measures serial time */
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    /* ================================================================
+       PARALLEL PHASE — timer starts here
+       MPI_Barrier ensures all processes start together.
+       ================================================================ */
+    MPI_Barrier(MPI_COMM_WORLD);
+    double par_start = MPI_Wtime();
+
+    /* ================================================================
+       COLLECTIVE FUNCTION 1: MPI_Bcast
+       Root broadcasts only the dataset size N (1 integer) so that
+       every process can compute its chunk size and allocate memory.
+       Communication cost: O(1) — negligible.
+       ================================================================ */
+    MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    /* Compute chunk sizes and displacements (all processes do this) */
+    int base_chunk = n / size;
+    int remainder  = n % size;
+
+    int *send_counts = (int *)malloc(size * sizeof(int));
+    int *displs      = (int *)malloc(size * sizeof(int));
+    if (!send_counts || !displs) {
+        fprintf(stderr, "Process %d: malloc failed\n", rank);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    int offset = 0;
+    for (int i = 0; i < size; i++) {
+        send_counts[i] = base_chunk + (i < remainder ? 1 : 0);
+        displs[i]      = offset;
+        offset        += send_counts[i];
+    }
+    int my_count = send_counts[rank];
+
+    /* Each process allocates only its own chunk — N/P elements */
+    double *x_local = (double *)malloc((size_t)my_count * sizeof(double));
+    double *y_local = (double *)malloc((size_t)my_count * sizeof(double));
     if (!x_local || !y_local) {
-        fprintf(stderr, "Process %d: malloc for local chunk failed\n", rank);
+        fprintf(stderr, "Process %d: malloc failed for local chunk\n", rank);
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
     /* ================================================================
        COLLECTIVE FUNCTION 2: MPI_Scatterv
-       Root distributes x[] and y[] chunks to each process.
-       Each worker receives ONLY its own slice — no full-array copy.
+       Root distributes data chunks to each process.
+       Each process receives exactly its N/P elements — not the full
+       dataset. Memory per process drops from O(N) to O(N/P).
+       Communication cost per process: O(N/P) instead of O(N).
        ================================================================ */
-    MPI_Barrier(MPI_COMM_WORLD);
-    double par_start = MPI_Wtime();
-
+    double t_scatter_start = MPI_Wtime();
     MPI_Scatterv(x_full, send_counts, displs, MPI_DOUBLE,
-                 x_local, my_count,           MPI_DOUBLE,
+                 x_local, my_count, MPI_DOUBLE,
                  0, MPI_COMM_WORLD);
     MPI_Scatterv(y_full, send_counts, displs, MPI_DOUBLE,
-                 y_local, my_count,           MPI_DOUBLE,
+                 y_local, my_count, MPI_DOUBLE,
                  0, MPI_COMM_WORLD);
+    double t_scatter_end = MPI_Wtime();
+
+    /* Root no longer needs the full arrays — free them to save memory */
+    if (rank == 0) {
+        free(x_full); x_full = NULL;
+        free(y_full); y_full = NULL;
+    }
 
     /* ================================================================
        STEP 2 — EACH PROCESS COMPUTES PARTIAL SUMS OVER ITS CHUNK
        ================================================================ */
-    double local_Sx  = 0.0;
-    double local_Sy  = 0.0;
-    double local_Sxx = 0.0;
-    double local_Sxy = 0.0;
+    double local_Sx  = 0.0, local_Sy  = 0.0;
+    double local_Sxx = 0.0, local_Sxy = 0.0;
 
+    double t_compute_start = MPI_Wtime();
     for (int i = 0; i < my_count; i++) {
         local_Sx  += x_local[i];
         local_Sy  += y_local[i];
         local_Sxx += x_local[i] * x_local[i];
         local_Sxy += x_local[i] * y_local[i];
     }
+    double t_compute_end = MPI_Wtime();
+    double compute_time = t_compute_end - t_compute_start;
+
+    free(x_local);
+    free(y_local);
 
     /* ================================================================
        COLLECTIVE FUNCTION 3: MPI_Reduce
        Each process sends its partial sums; root accumulates them.
        ================================================================ */
-    double global_Sx  = 0.0;
-    double global_Sy  = 0.0;
-    double global_Sxx = 0.0;
-    double global_Sxy = 0.0;
+    double global_Sx  = 0.0, global_Sy  = 0.0;
+    double global_Sxx = 0.0, global_Sxy = 0.0;
 
+    double t_reduce_start = MPI_Wtime();
     MPI_Reduce(&local_Sx,  &global_Sx,  1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_Sy,  &global_Sy,  1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_Sxx, &global_Sxx, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(&local_Sxy, &global_Sxy, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    double t_reduce_end = MPI_Wtime();
 
+    /* Parallel phase ends here */
     MPI_Barrier(MPI_COMM_WORLD);
-    double par_end = MPI_Wtime();
+    double par_time_total = MPI_Wtime() - par_start;
+
+    /* Derived timing metrics */
+    double comm_time        = (t_scatter_end - t_scatter_start) + (t_reduce_end - t_reduce_start);
+    /* compute_time is the max across all ranks (bottleneck) — reduce to root */
+    double compute_time_max = 0.0;
+    MPI_Reduce(&compute_time, &compute_time_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    double comm_time_max    = 0.0;
+    MPI_Reduce(&comm_time,    &comm_time_max,    1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     /* ================================================================
        STEP 3 — ROOT COMPUTES FINAL COEFFICIENTS AND REPORTS
        ================================================================ */
     if (rank == 0) {
-        /* Parallel OLS coefficients */
         double denom     = (double)n * global_Sxx - global_Sx * global_Sx;
         double beta1_par = ((double)n * global_Sxy - global_Sx * global_Sy) / denom;
         double beta0_par = (global_Sy - beta1_par * global_Sx) / (double)n;
-        double par_time  = par_end - par_start;
 
-        /* Sequential baseline for speedup comparison */
-        double seq_start = MPI_Wtime();
-        double beta0_seq, beta1_seq;
-        sequential_lr(x_full, y_full, n, &beta0_seq, &beta1_seq);
-        double seq_time = MPI_Wtime() - seq_start;
+        /* Re-generate data on root only for MSE verification */
+        double *xv = (double *)malloc((size_t)n * sizeof(double));
+        double *yv = (double *)malloc((size_t)n * sizeof(double));
+        if (xv && yv) generate_data(xv, yv, n, 42);
 
-        double mse_seq    = compute_mse(x_full, y_full, n, beta0_seq, beta1_seq);
-        double mse_par    = compute_mse(x_full, y_full, n, beta0_par, beta1_par);
-        double speedup    = seq_time / par_time;
-        double efficiency = speedup / (double)size;
+        double mse_seq = (xv && yv) ? compute_mse(xv, yv, n, beta0_seq, beta1_seq) : -1.0;
+        double mse_par = (xv && yv) ? compute_mse(xv, yv, n, beta0_par, beta1_par) : -1.0;
+
+        free(xv); free(yv);
+
+        double speedup_compute    = serial_time / compute_time_max;
+        double speedup_total      = serial_time / par_time_total;
+        double efficiency_compute = speedup_compute / (double)size;
+        double efficiency_total   = speedup_total   / (double)size;
 
         printf("=======================================================\n");
         printf("  Parallel Linear Regression (MPI)\n");
@@ -231,35 +277,37 @@ int main(int argc, char **argv)
         printf("[Sequential]\n");
         printf("  beta0 = %.6f   beta1 = %.6f\n", beta0_seq, beta1_seq);
         printf("  MSE   = %.8f\n", mse_seq);
-        printf("  Time  = %.6f s\n", seq_time);
+        printf("  Time  = %.6f s\n", serial_time);
         printf("\n[Parallel]\n");
         printf("  beta0 = %.6f   beta1 = %.6f\n", beta0_par, beta1_par);
         printf("  MSE   = %.8f\n", mse_par);
-        printf("  Time  = %.6f s\n", par_time);
+        printf("  Compute Time = %.6f s\n", compute_time_max);
+        printf("  Comm    Time = %.6f s  (Scatterv x2 + Reduce x4)\n", comm_time_max);
+        printf("  Total   Time = %.6f s\n", par_time_total);
         printf("\n[Performance]\n");
-        printf("  Speedup    = %.4f\n", speedup);
-        printf("  Efficiency = %.4f\n", efficiency);
+        printf("  Speedup  (compute) = %.4f   Efficiency = %.4f\n",
+               speedup_compute, efficiency_compute);
+        printf("  Speedup  (total)   = %.4f   Efficiency = %.4f\n",
+               speedup_total,   efficiency_total);
         printf("=======================================================\n");
 
-        /* Append timing row to CSV (for analysis.py) */
         FILE *fp = fopen("timing_output.csv", "a");
         if (fp) {
             fseek(fp, 0, SEEK_END);
             if (ftell(fp) == 0)
-                fprintf(fp, "N,P,seq_time,par_time\n");
-            fprintf(fp, "%d,%d,%.8f,%.8f\n", n, size, seq_time, par_time);
+                fprintf(fp, "N,P,serial_time,compute_time,comm_time,par_time_total,"
+                            "speedup_compute,speedup_total,efficiency_compute,efficiency_total\n");
+            fprintf(fp, "%d,%d,%.8f,%.8f,%.8f,%.8f,%.4f,%.4f,%.4f,%.4f\n",
+                    n, size,
+                    serial_time, compute_time_max, comm_time_max, par_time_total,
+                    speedup_compute, speedup_total,
+                    efficiency_compute, efficiency_total);
             fclose(fp);
         }
-
-        free(x_full);
-        free(y_full);
     }
 
-    free(x_local);
-    free(y_local);
     free(send_counts);
     free(displs);
-
     MPI_Finalize();
     return 0;
 }
