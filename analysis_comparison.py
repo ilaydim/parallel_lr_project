@@ -40,7 +40,9 @@ for df in [df_sc, df_bc]:
         p1 = df[(df["N"] == n) & (df["P"] == 1)]
         if p1.empty:
             continue
-        t_s  = p1["serial_time"].values[0]
+        t_s = p1["serial_time"].values[0]
+        if t_s < 1e-5:
+            t_s = p1["par_time_total"].values[0]
         mask = df["N"] == n
         df.loc[mask, "speedup_compute"] = t_s / df.loc[mask, "compute_time"]
         df.loc[mask, "speedup_total"]   = t_s / df.loc[mask, "par_time_total"]
